@@ -51,7 +51,7 @@ This project is an automated tool that analyzes Python code in a Git repository,
 Run the main script to start analyzing:
 
 ```bash
-python script.py
+python github_issue.py
 ```
 
 Follow the console instructions to provide the path to the repository and the folder you wish to analyze.
