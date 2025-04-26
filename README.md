@@ -1,11 +1,14 @@
 # GitHub Code Analyzer
 
-This project is an automated tool that analyzes Python code in a Git repository, identifies issues related to logic, performance, best practices, and security, and creates issues or pull requests on GitHub for each problem found. The tool uses the GitHub API and an AI model to carry out its analysis.
+This project is an automated tool that analyzes Python code in a Git repository, identifies issues related to logic,
+performance, best practices, and security, and creates issues or pull requests on GitHub for each problem found. The
+tool uses the GitHub API and an AI model to carry out its analysis.
 
 ## Features
 
 - **Code Analysis:** Detects errors, performance improvements, readability enhancements, and security vulnerabilities.
-- **Issue and Pull Request Creation:** Automatically generates GitHub issues detailing each problem found and creates pull requests for critical issues.
+- **Issue and Pull Request Creation:** Automatically generates GitHub issues detailing each problem found and creates
+  pull requests for critical issues.
 - **Issue Summary:** Consolidates detected issues into a global summary report.
 - **AI Automation:** Utilizes the OpenAI API to provide automated suggestions.
 

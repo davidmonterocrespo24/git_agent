@@ -1,244 +1,40 @@
-import os
-import re
 import glob
 import json
-import logging
-from typing import List, Dict, Any, Optional
-from dotenv import load_dotenv
-import ast, tempfile
-import chardet
+import os
+import re
+import textwrap
 import traceback
+from datetime import datetime, timezone
+from typing import List, Dict, Any
+
+import chardet
+from config.settings import settings
+from diff_match_patch import diff_match_patch
+from dotenv import load_dotenv
 from git import Repo, GitCommandError  # Import GitCommandError
 from github import Github
-import textwrap
-from slugify import slugify  # pip install python-slugify
-import datetime as _dt
-from datetime import datetime, timezone
-from pydantic import BaseModel, Field
-from langchain.agents import AgentType, initialize_agent, tool
+from langchain.agents import AgentType, initialize_agent
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage
-from diff_match_patch import diff_match_patch
+from slugify import slugify  # pip install python-slugify
+from tools.code_analyzer_tool import code_analyzer
+from tools.github_tool import github_pr_creator
 
-# ────────────────────────────────
-# 0. Logging Configuration
-# ────────────────────────────────
+from git_agent.log import logger
 
-# code (conceptual diff)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
-
-# ────────────────────────────────
-# 1. Load Environment Variables
-# ────────────────────────────────
 load_dotenv()
-# https://github.com/davidmonterocrespo24/odoo_micro_saas
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER")
-GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME", "o3")  # Improved default value
 
 # Environment variables validation
 required_vars = {
-    "GITHUB_TOKEN": GITHUB_TOKEN,
-    "GITHUB_REPO_OWNER": GITHUB_REPO_OWNER,
-    "GITHUB_REPO_NAME": GITHUB_REPO_NAME,
-    "OPENAI_API_KEY": OPENAI_API_KEY,
+    "GITHUB_TOKEN": settings.GITHUB_TOKEN,
+    "GITHUB_REPO_OWNER": settings.GITHUB_REPO_OWNER,
+    "GITHUB_REPO_NAME": settings.GITHUB_REPO_NAME,
+    "OPENAI_API_KEY": settings.OPENAI_API_KEY,
 }
 for var_name, value in required_vars.items():
     if not value:
         raise RuntimeError(f"Variable {var_name} not defined in .env")
 
 
-def _is_valid_python(code: str) -> bool:
-    try:
-        ast.parse(code)
-        return True
-    except SyntaxError:
-        return False
-
-
-# ────────────────────────────────
-# 2. Code Analysis Tool
-# ────────────────────────────────
-SYSTEM_TEMPLATE = """
-You are an expert Python code analyst AI with deep knowledge of optimization techniques, security vulnerabilities, common error patterns, and Python best practices (including PEP 8).
-
-TASK:
-Analyze the provided Python code block below the marker `--- CODE START ---` and identify issues across the following categories:
-
-1.  **ERROR**: Logical flaws, potential runtime exceptions (e.g., `IndexError`, `TypeError`), off-by-one errors, incorrect assumptions, or behaviors that deviate from probable intent.
-2.  **PERFORMANCE**: Inefficiencies, performance bottlenecks, suboptimal algorithm choices, unnecessary computations, inefficient use of data structures, or blocking I/O operations.
-3.  **IMPROVEMENT**: Opportunities to enhance readability, maintainability, or adherence to Pythonic idioms and PEP 8 standards. This includes overly complex logic, non-descriptive naming, lack of comments where needed, or violations of the DRY (Don't Repeat Yourself) principle.
-4.  **SECURITY**: Potential security vulnerabilities, unsafe practices, or exposure to common threats. Examples include SQL injection, cross-site scripting (XSS) vectors, hardcoded secrets, insecure handling of external input, use of deprecated/unsafe modules or functions (like `pickle` with untrusted data).
-
-IMPORTANT INSTRUCTIONS:
-* Return **EXCLUSIVELY** a single, valid JSON object adhering precisely to the schema below.
-* Do **NOT** include any explanatory text, greetings, apologies, or any other content outside the JSON structure.
-* If no significant issues are found, respond **ONLY** with: `{ "issues": [] }`
-* Analyze the code **as provided**. Do not make assumptions about external context or missing imports unless explicitly stated in the code.
-* Focus on concrete issues within the provided code snippet.
-
-JSON SCHEMA:
-{
-  "issues": [
-    {
-     "type": "ERROR | PERFORMANCE | IMPROVEMENT | SECURITY", // Must be one of these exact strings
-      "title": "Concise, descriptive title of the issue (max 15 words)",
-      "line_number": integer, // The primary line number where the issue occurs or starts
-      "description": "Detailed explanation: Clearly describe the issue, why it's problematic, and its potential impact.",
-      "original_code": "The specific line(s) of original code relevant to the issue. Preserve indentation.",
-      "solution": "The corrected or improved code fragment intended to replace 'original_code'. Provide ONLY the code, preserving indentation. Should be runnable in context.",
-      "diff": "Code (conceptual diff)",
-      "severity": "HIGH|MEDIUM|LOW" 
-    }
-  ]
-}
-
-SEVERITY GUIDELINES:
-* **HIGH**: Critical issues likely to cause program failure, incorrect results, data loss/corruption, or significant security vulnerabilities.
-* **MEDIUM**: Important issues impacting performance noticeably, hindering maintainability significantly, or representing moderate security risks.
-* **LOW**: Minor issues related to style, readability, best practices, or potential micro-optimizations with limited impact.
-
-If you don't find significant issues, respond exactly with:
-{ "issues": [] }
-
-DO NOT include additional explanations or text outside the JSON.
-"""
-
-
-class PRPayload(BaseModel):
-    title: str = Field(...)
-    body: str = Field(...)
-    head_branch: str = Field(..., description="Branch containing the changes")
-    base_branch: str = Field(default="main")
-
-
-@tool(
-    "github_pr_creator",
-    args_schema=PRPayload,
-    return_direct=True,
-    description="Creates a GitHub Pull-Request and returns its URL",
-)
-def github_pr_creator(
-    title: str, body: str, head_branch: str, base_branch: str = "main"
-) -> str:
-    try:
-        gh = Github(GITHUB_TOKEN)
-        repo = gh.get_repo(f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}")
-        pr = repo.create_pull(
-            title=title, body=body, head=head_branch, base=base_branch, draft=False
-        )
-        logger.info(f"PR created: {pr.html_url}")
-        return pr.html_url
-    except Exception as e:
-        logger.error(f"Error creating PR: {e}")
-        return f"Error creating PR: {e}"
-
-
-class AnalyzerInput(BaseModel):
-    file_path: str = Field(description="Absolute path to the .py file")
-    code: str = Field(description="Complete content of the .py file")
-
-
-@tool(
-    "code_analyzer",
-    args_schema=AnalyzerInput,
-    return_direct=True,
-    description="Analyzes Python code and returns JSON with issues",
-)
-def code_analyzer(file_path: str, code: str) -> str:
-    """
-    Analyzes Python code to identify logical issues, performance, security and best practices.
-
-    Args:
-        code_and_path: String with format "<file_path>\n<<<CODE>>>\n<code_content>"
-
-    Returns:
-        A JSON (str) with the issues found or an empty object if no issues found.
-    """
-    try:
-        file_name = os.path.basename(file_path)
-        logger.info(f"Analyzing file: {file_name}")
-    except ValueError:
-        logger.error("Incorrect format in code_analyzer input")
-        return json.dumps({"issues": [], "error": "Incorrect format received"})
-
-    try:
-        llm = ChatOpenAI(model=MODEL_NAME, api_key=OPENAI_API_KEY)
-
-        messages = [
-            SystemMessage(content=SYSTEM_TEMPLATE),
-            SystemMessage(content=f"File: {file_path}\n```python\n{code}\n```"),
-        ]
-
-        response = llm.invoke(messages)
-
-        # Extract only JSON from the response
-        match = re.search(r"\{[\s\S]*\}", response.content)
-        if match:
-            result = match.group(0)
-            # Validate that it's a well-formed JSON
-            json.loads(result)  # This will raise an exception if not valid JSON
-            return result
-
-        logger.warning(f"No JSON found in response for {file_name}")
-        return json.dumps({"issues": []})
-
-    except Exception as e:
-        logger.error(f"Error during analysis of {file_name}: {str(e)}")
-        return json.dumps({"issues": [], "error": f"Error: {str(e)}"})
-
-
-# ────────────────────────────────
-# 3. Tool for creating GitHub issues
-# ────────────────────────────────
-@tool(
-    "github_issue_creator",
-    return_direct=True,
-    args_schema=None,
-    description="Creates a GitHub issue and returns the URL",
-)
-def github_issue_creator(payload: str) -> str:
-    """
-    Creates a GitHub issue based on the provided information.
-
-    Args:
-        payload: JSON with fields title, body, and labels (optional)
-
-    Returns:
-        URL of the created issue or error message
-    """
-    try:
-        data = json.loads(payload)
-        title = data["title"]
-        body = data["body"]
-        labels = data.get("labels", [])
-
-        logger.info(f"Creating issue: {title}")
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.error(f"Error parsing issue payload: {e}")
-        return f"Error: Could not process the payload ({e})"
-
-    try:
-        gh = Github(GITHUB_TOKEN)
-        repo = gh.get_repo(f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}")
-        issue = repo.create_issue(title=title, body=body, labels=labels)
-        logger.info(f"Issue created: {issue.html_url}")
-        return issue.html_url
-    except Exception as e:
-        logger.error(f"Error creating GitHub issue: {e}")
-        return f"Error creating issue: {str(e)}"
-
-
-# ────────────────────────────────
-# 4. Main Analyzer Class
-# ────────────────────────────────
 class GitRepoAnalyzer:
     """
     Class for analyzing a Git repository, identifying code issues
@@ -267,7 +63,7 @@ class GitRepoAnalyzer:
         # Initialize LangChain agent
         self.agent = initialize_agent(
             tools=[code_analyzer, github_pr_creator],
-            llm=ChatOpenAI(model=MODEL_NAME, api_key=OPENAI_API_KEY),
+            llm=ChatOpenAI(model=settings.MODEL_NAME, api_key=settings.OPENAI_API_KEY),
             agent=AgentType.OPENAI_FUNCTIONS,
             verbose=False,
             handle_parsing_errors=True,
@@ -321,7 +117,7 @@ class GitRepoAnalyzer:
             GitHub URL for the file
         """
         rel_path = os.path.relpath(file_path, self.repo_path)
-        return f"https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/blob/{self._commit_sha()}/{rel_path}"
+        return f"https://github.com/{settings.GITHUB_REPO_OWNER}/{settings.GITHUB_REPO_NAME}/blob/{self._commit_sha()}/{rel_path}"
 
     def _line_url(self, file_path: str, line_number: int) -> str:
         """
@@ -429,7 +225,7 @@ class GitRepoAnalyzer:
                 "type": issue["type"],
                 "title": issue["title"],
                 "severity": issue["severity"],
-                "url": issue_url
+                "url": issue_url,
             }
             try:
                 # --- 1) Create GitHub Issue ---
@@ -497,8 +293,8 @@ class GitRepoAnalyzer:
 *This issue was automatically generated by an AI code analysis*
 """
 
-                gh = Github(GITHUB_TOKEN)
-                repo = gh.get_repo(f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}")
+                gh = Github(settings.GITHUB_TOKEN)
+                repo = gh.get_repo(f"{settings.GITHUB_REPO_OWNER}/{settings.GITHUB_REPO_NAME}")
 
                 created_gh_issue = repo.create_issue(
                     title=f"[{issue['type']}][{issue['severity']}] {issue['title']}",
@@ -512,7 +308,10 @@ class GitRepoAnalyzer:
                 issue_number = created_gh_issue.number
                 issue_url = created_gh_issue.html_url
                 logger.info(f"Issue created: {issue_url}")
-                issue_info_for_summary = {"url": issue_url, **issue} # Basic info for summary
+                issue_info_for_summary = {
+                    "url": issue_url,
+                    **issue,
+                }  # Basic info for summary
 
                 # ---------- 2) if NOT HIGH, move to the next one ------------
                 # Only patch if git state was clean and severity is HIGH/MEDIUM
@@ -534,7 +333,9 @@ class GitRepoAnalyzer:
                     continue  # Move to next issue in the file
 
                 # ---------- 3) create branch, commit and push ----------------------
-                logger.info(f"Attempting auto-patch for issue #{issue_number} (Severity: {issue['severity']})")            
+                logger.info(
+                    f"Attempting auto-patch for issue #{issue_number} (Severity: {issue['severity']})"
+                )
                 branch_name = self._create_branch_name(issue["title"], issue_number)
                 patch_applied = False
                 self.repo.git.checkout(
@@ -586,7 +387,7 @@ class GitRepoAnalyzer:
                     continue
 
                 # ---------- 4) create Pull-Request -----------------------------
-                if patch_applied:                    
+                if patch_applied:
                     pr_title = f"AI Fix #{issue_number}: {issue['title']}"
                     pr_body = f"Closes #{issue_number}\n\nAutomatically applied AI code suggestion.\n\nPlease review carefully."
                     try:
@@ -816,7 +617,7 @@ class GitRepoAnalyzer:
                 elif issue.get("branch") and issue.get("pr_creation_failed"):
                     body += f" (Fix branch: `{issue['branch']}` - PR Failed)"
                 elif issue.get(
-                    "branch"
+                        "branch"
                 ):  # Patch applied but no PR attempt (e.g., wrong severity)
                     body += f" (Fix branch: `{issue['branch']}`)"
                 body += "\n"
@@ -832,7 +633,7 @@ class GitRepoAnalyzer:
         if total_issues > 0:
             body += "\n### By Issue Type\n"
             for issue_type, count in sorted(
-                issues_by_type.items(), key=lambda item: item[1], reverse=True
+                    issues_by_type.items(), key=lambda item: item[1], reverse=True
             ):
                 percentage = (count / total_issues) * 100
                 body += f"- **{issue_type}:** {count} ({percentage:.1f}%)\n"
@@ -840,8 +641,8 @@ class GitRepoAnalyzer:
             body += "\n### By Severity Level\n"
             severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
             for severity, count in sorted(
-                issues_by_severity.items(),
-                key=lambda item: severity_order.get(item[0], 99),
+                    issues_by_severity.items(),
+                    key=lambda item: severity_order.get(item[0], 99),
             ):
                 if count > 0:
                     percentage = (count / total_issues) * 100
@@ -878,8 +679,8 @@ class GitRepoAnalyzer:
         print(f"🔍 Creating summary issue...")
         print(f"📌 Summary issue payload: {json.dumps(payload, indent=2)}")
         try:
-            gh = Github(GITHUB_TOKEN)
-            repo = gh.get_repo(f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}")
+            gh = Github(settings.GITHUB_TOKEN)
+            repo = gh.get_repo(f"{settings.GITHUB_REPO_OWNER}/{settings.GITHUB_REPO_NAME}")
             issue = repo.create_issue(
                 title=payload["title"], body=payload["body"], labels=payload["labels"]
             )
@@ -904,11 +705,11 @@ class GitRepoAnalyzer:
         return f"ai/fix/{date_str}/{issue_number}-{slug}"
 
     def _apply_patch(
-        self,
-        file_path: str,
-        line_num: int,
-        original_code_snippet: str,
-        new_code_snippet: str,
+            self,
+            file_path: str,
+            line_num: int,
+            original_code_snippet: str,
+            new_code_snippet: str,
     ):
         """
         Generates a patch using diff-match-patch and applies it using `git apply`.
@@ -972,32 +773,36 @@ class GitRepoAnalyzer:
 
         # --- Create the modified lines list ---
         modified_lines = (
-            original_lines[0:idx] +
-            prepared_new_lines +
-            original_lines[idx + num_original_snippet_lines:]
+                original_lines[0:idx]
+                + prepared_new_lines
+                + original_lines[idx + num_original_snippet_lines:]
         )
         modified_full_content = "".join(modified_lines)
-        original_full_content = "".join(original_lines) # For comparison
+        original_full_content = "".join(original_lines)  # For comparison
 
         # Check if content actually changed
         if original_full_content == modified_full_content:
-            logger.warning(f"Proposed solution for {file_basename}:{line_num} resulted in no change to file content. Skipping modification.")
-            return # No change needed
+            logger.warning(
+                f"Proposed solution for {file_basename}:{line_num} resulted in no change to file content. Skipping modification."
+            )
+            return  # No change needed
 
         # --- Write the modified content back to the file ---
         try:
-             with open(file_path, "w", encoding=encoding, newline='') as f:
-                  f.writelines(modified_lines)
-             logger.info(f"Successfully wrote modifications to {file_basename}")
+            with open(file_path, "w", encoding=encoding, newline="") as f:
+                f.writelines(modified_lines)
+            logger.info(f"Successfully wrote modifications to {file_basename}")
         except Exception as e:
             logger.error(f"Error writing modifications back to {file_path}: {e}")
             # Consider restoring original content if write fails? Complex. Better to fail.
-            raise # Re-raise the exception
+            raise  # Re-raise the exception
 
         # --- Stage the changes using git add ---
         try:
             self.repo.index.add([file_path])
-            logger.info(f"Successfully staged changes in {file_basename} using git add.")
+            logger.info(
+                f"Successfully staged changes in {file_basename} using git add."
+            )
         except GitCommandError as e:
             logger.error(f"git add failed for {file_basename}!")
             logger.error(f"Command: {e.command}")
@@ -1005,20 +810,28 @@ class GitRepoAnalyzer:
             logger.error(f"Stderr: {e.stderr.strip()}")
             # Attempt to reset the file in the working directory if add fails?
             try:
-                self.repo.git.checkout('--', file_path)
-                logger.warning(f"Attempted to reset {file_basename} in working directory after git add failure.")
+                self.repo.git.checkout("--", file_path)
+                logger.warning(
+                    f"Attempted to reset {file_basename} in working directory after git add failure."
+                )
             except Exception as reset_err:
-                logger.error(f"Could not reset {file_basename} after git add failure: {reset_err}")
-            raise # Re-raise the GitCommandError
+                logger.error(
+                    f"Could not reset {file_basename} after git add failure: {reset_err}"
+                )
+            raise  # Re-raise the GitCommandError
         except Exception as e:
-             logger.error(f"An unexpected error occurred during git add: {e}")
-             # Also try reset here
-             try:
-                 self.repo.git.checkout('--', file_path)
-                 logger.warning(f"Attempted to reset {file_basename} in working directory after unexpected git add error.")
-             except Exception as reset_err:
-                 logger.error(f"Could not reset {file_basename} after unexpected git add error: {reset_err}")
-             raise
+            logger.error(f"An unexpected error occurred during git add: {e}")
+            # Also try reset here
+            try:
+                self.repo.git.checkout("--", file_path)
+                logger.warning(
+                    f"Attempted to reset {file_basename} in working directory after unexpected git add error."
+                )
+            except Exception as reset_err:
+                logger.error(
+                    f"Could not reset {file_basename} after unexpected git add error: {reset_err}"
+                )
+            raise
 
     def _commit_and_push(self, branch: str, files_to_add: List[str], message: str):
         origin = self.repo.remote(name="origin")
@@ -1034,47 +847,3 @@ class GitRepoAnalyzer:
 
         # Push (origin needs to use https://x-access-token:TOKEN@... or already authorized ssh-agent)
         origin.push(branch)
-
-
-def main():
-    """Main function that runs the analysis"""
-    print("\n🔍 GitHub Issue Creator - Code Analysis 🔍\n")
-
-    try:
-        repo_path = input("Path to local repository: ").rstrip("/")
-        target_folder = input("Folder to analyze (relative to repo): ").rstrip("/")
-
-        # Validate paths
-        if not os.path.isdir(repo_path):
-            print(f"❌ Path {repo_path} doesn't exist or is not a directory")
-            return
-
-        folder_path = os.path.join(repo_path, target_folder)
-        if not os.path.isdir(folder_path):
-            print(f"❌ Folder {target_folder} doesn't exist in the repository")
-            return
-
-        # Confirm operation
-        print(f"\n📁 Will analyze: {folder_path}")
-        confirm = input("Continue? (y/n): ").lower()
-        if confirm != "y":
-            print("❌ Operation cancelled")
-            return
-
-        # Run analysis
-        print("\n🚀 Starting analysis...\n")
-        analyzer = GitRepoAnalyzer(repo_path, target_folder)
-        analyzer.analyze_folder()
-
-        print("\n✅ Analysis completed!\n")
-
-    except KeyboardInterrupt:
-        print("\n❌ Operation interrupted by user")
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        traceback.print_exc()
-        logger.exception("Error in main execution")
-
-
-if __name__ == "__main__":
-    main()
