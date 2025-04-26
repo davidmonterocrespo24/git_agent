@@ -425,7 +425,12 @@ class GitRepoAnalyzer:
 
         # --- Process issues: Create Issue first, then optionally Patch & PR ---
         for issue in issues:
-            issue_info_for_summary = {}
+            issue_info_for_summary = {
+                "type": issue["type"],
+                "title": issue["title"],
+                "severity": issue["severity"],
+                "url": issue_url
+            }
             try:
                 # --- 1) Create GitHub Issue ---
                 file_rel_path = os.path.relpath(file_path, self.repo_path).replace(
@@ -507,6 +512,7 @@ class GitRepoAnalyzer:
                 issue_number = created_gh_issue.number
                 issue_url = created_gh_issue.html_url
                 logger.info(f"Issue created: {issue_url}")
+                issue_info_for_summary = {"url": issue_url, **issue} # Basic info for summary
 
                 # ---------- 2) if NOT HIGH, move to the next one ------------
                 # Only patch if git state was clean and severity is HIGH/MEDIUM
@@ -580,7 +586,7 @@ class GitRepoAnalyzer:
                     continue
 
                 # ---------- 4) create Pull-Request -----------------------------
-                if patch_applied:
+                if patch_applied:                    
                     pr_title = f"AI Fix #{issue_number}: {issue['title']}"
                     pr_body = f"Closes #{issue_number}\n\nAutomatically applied AI code suggestion.\n\nPlease review carefully."
                     try:
