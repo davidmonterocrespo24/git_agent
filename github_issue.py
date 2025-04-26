@@ -6,9 +6,9 @@ import logging
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 import ast, tempfile
-
-
-from git import Repo
+import chardet
+import traceback
+from git import Repo, GitCommandError  # Import GitCommandError
 from github import Github
 import textwrap
 from slugify import slugify  # pip install python-slugify
@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from langchain.agents import AgentType, initialize_agent, tool
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage
+from diff_match_patch import diff_match_patch
 
 # ────────────────────────────────
 # 0. Logging Configuration
@@ -52,6 +53,8 @@ required_vars = {
 for var_name, value in required_vars.items():
     if not value:
         raise RuntimeError(f"Variable {var_name} not defined in .env")
+
+
 def _is_valid_python(code: str) -> bool:
     try:
         ast.parse(code)
@@ -59,40 +62,48 @@ def _is_valid_python(code: str) -> bool:
     except SyntaxError:
         return False
 
+
 # ────────────────────────────────
 # 2. Code Analysis Tool
 # ────────────────────────────────
 SYSTEM_TEMPLATE = """
-You are an expert Python code analyst with extensive experience in optimization, security, and best practices.
+You are an expert Python code analyst AI with deep knowledge of optimization techniques, security vulnerabilities, common error patterns, and Python best practices (including PEP 8).
 
 TASK:
-Analyze the provided Python code and detect issues in these categories:
-1. ERROR: Logical errors, bugs, or incorrect behaviors
-2. PERFORMANCE: Inefficiencies or performance bottlenecks
-3. IMPROVEMENT: Opportunities to improve readability, maintainability, or follow PEP8
-4. SECURITY: Security vulnerabilities or unsafe practices
+Analyze the provided Python code block below the marker `--- CODE START ---` and identify issues across the following categories:
 
-IMPORTANT: Return EXCLUSIVELY a valid JSON following this schema precisely:
+1.  **ERROR**: Logical flaws, potential runtime exceptions (e.g., `IndexError`, `TypeError`), off-by-one errors, incorrect assumptions, or behaviors that deviate from probable intent.
+2.  **PERFORMANCE**: Inefficiencies, performance bottlenecks, suboptimal algorithm choices, unnecessary computations, inefficient use of data structures, or blocking I/O operations.
+3.  **IMPROVEMENT**: Opportunities to enhance readability, maintainability, or adherence to Pythonic idioms and PEP 8 standards. This includes overly complex logic, non-descriptive naming, lack of comments where needed, or violations of the DRY (Don't Repeat Yourself) principle.
+4.  **SECURITY**: Potential security vulnerabilities, unsafe practices, or exposure to common threats. Examples include SQL injection, cross-site scripting (XSS) vectors, hardcoded secrets, insecure handling of external input, use of deprecated/unsafe modules or functions (like `pickle` with untrusted data).
 
+IMPORTANT INSTRUCTIONS:
+* Return **EXCLUSIVELY** a single, valid JSON object adhering precisely to the schema below.
+* Do **NOT** include any explanatory text, greetings, apologies, or any other content outside the JSON structure.
+* If no significant issues are found, respond **ONLY** with: `{ "issues": [] }`
+* Analyze the code **as provided**. Do not make assumptions about external context or missing imports unless explicitly stated in the code.
+* Focus on concrete issues within the provided code snippet.
+
+JSON SCHEMA:
 {
   "issues": [
     {
-      "type": "ERROR|PERFORMANCE|IMPROVEMENT|SECURITY",
-      "title": "Short descriptive title",
-      "line_number": line_number,
-      "description": "Detailed description explaining why this is an issue and its impact",
-      "original_code": "Original code or relevant fragment",
-      "solution": "Only the replacement code. DO NOT include explanatory comments or text. Maintain the same indentation as the original fragment.",
+     "type": "ERROR | PERFORMANCE | IMPROVEMENT | SECURITY", // Must be one of these exact strings
+      "title": "Concise, descriptive title of the issue (max 15 words)",
+      "line_number": integer, // The primary line number where the issue occurs or starts
+      "description": "Detailed explanation: Clearly describe the issue, why it's problematic, and its potential impact.",
+      "original_code": "The specific line(s) of original code relevant to the issue. Preserve indentation.",
+      "solution": "The corrected or improved code fragment intended to replace 'original_code'. Provide ONLY the code, preserving indentation. Should be runnable in context.",
       "diff": "Code (conceptual diff)",
       "severity": "HIGH|MEDIUM|LOW" 
     }
   ]
 }
 
-Severity should be assigned according to these rules:
-- HIGH: Critical issues that could cause failures, data loss, or serious vulnerabilities
-- MEDIUM: Important issues affecting performance or code quality
-- LOW: Minor improvements or optimization suggestions
+SEVERITY GUIDELINES:
+* **HIGH**: Critical issues likely to cause program failure, incorrect results, data loss/corruption, or significant security vulnerabilities.
+* **MEDIUM**: Important issues impacting performance noticeably, hindering maintainability significantly, or representing moderate security risks.
+* **LOW**: Minor issues related to style, readability, best practices, or potential micro-optimizations with limited impact.
 
 If you don't find significant issues, respond exactly with:
 { "issues": [] }
@@ -234,7 +245,7 @@ class GitRepoAnalyzer:
     and creating GitHub issues for each problem found.
     """
 
-    def __init__(self, repo_path: str, target_folder: str):
+    def __init__(self, repo_path: str, target_folder: str, base_branch: str = None):
         """
         Initializes the repository analyzer.
 
@@ -244,16 +255,18 @@ class GitRepoAnalyzer:
         """
         self.repo_path = repo_path
         self.target_folder = target_folder
+        self.dmp = diff_match_patch()
 
         # Validate that the repo is a valid Git repository
         try:
             self.repo = Repo(repo_path)
+            self.base_branch = base_branch or self.repo.active_branch.name
         except Exception as e:
             raise ValueError(f"Could not initialize Git repository: {e}")
 
         # Initialize LangChain agent
         self.agent = initialize_agent(
-            tools=[code_analyzer, github_issue_creator, github_pr_creator],
+            tools=[code_analyzer, github_pr_creator],
             llm=ChatOpenAI(model=MODEL_NAME, api_key=OPENAI_API_KEY),
             agent=AgentType.OPENAI_FUNCTIONS,
             verbose=False,
@@ -262,13 +275,36 @@ class GitRepoAnalyzer:
 
         logger.info(f"Analyzer initialized for {target_folder} in {repo_path}")
 
-    def _detect_eol(self, file_path: str) -> str:
-        with open(file_path, 'rb') as f:
-            sample = f.read(8192)
-        if b'\r\n' in sample:
-            return '\r\n'
-        return '\n'
-    
+    def _detect_eol_and_encoding(self, file_path: str) -> tuple[str, str]:
+        """Detects line ending ('\n' or '\r\n') and file encoding."""
+        try:
+            with open(file_path, "rb") as f:
+                # Read a larger sample for encoding detection, or whole file if small
+                sample = f.read(16384)  # Read more for better encoding detection
+                f.seek(0)  # Go back to start
+                full_content_bytes = f.read()
+
+            detection = chardet.detect(full_content_bytes)
+            encoding = detection["encoding"] if detection["encoding"] else "utf-8"
+            # Normalize common variations
+            if encoding.lower() in ["ascii"]:
+                encoding = "utf-8"  # Treat ASCII as UTF-8 subset
+
+            # Detect EOL from the sample
+            eol = "\n"  # Default to LF
+            if b"\r\n" in sample:
+                eol = "\r\n"
+            elif b"\r" in sample and b"\n" not in sample:
+                eol = "\r"  # Handle classic Mac OS EOL if necessary
+
+            logger.debug(
+                f"Detected EOL='{eol.encode()}' Encoding='{encoding}' for {os.path.basename(file_path)}"
+            )
+            return eol, encoding
+        except Exception as e:
+            logger.error(f"Error detecting EOL/Encoding for {file_path}: {e}")
+            return "\n", "utf-8"  # Fallback defaults
+
     # Utility methods for GitHub links
     def _commit_sha(self) -> str:
         """Gets the SHA of the current commit on the current branch"""
@@ -310,68 +346,136 @@ class GitRepoAnalyzer:
         Returns:
             List of dictionaries with information about created issues
         """
-        logger.info(f"Analyzing file: {os.path.basename(file_path)}")
+        file_name = os.path.basename(file_path)
+        logger.info(f"Starting analysis for: {file_name}")
 
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
+            _eol, encoding = self._detect_eol_and_encoding(file_path)
+            # Read with universal newline support, let Python handle EOL internally for now
+            with open(file_path, "r", encoding=encoding, newline="") as f:
                 code = f.read()
+            if not code:
+                logger.warning(f"File {file_name} is empty, skipping analysis.")
+                return []
         except Exception as e:
             logger.error(f"Error reading file {file_path}: {e}")
+            traceback.print_exc()
             return []
-
-        # Prepare input for the analyzer
-        input_str = f"{file_path}\n<<<CODE>>>\n{code}"
 
         try:
-            # Invoke agent to execute code_analyzer
-            response = self.agent.invoke(
-                {"input": f"Analyze this file:\n{input_str}"}
+            analyzer_response_str = code_analyzer.invoke(
+                {"file_path": file_path, "code": code}
             )
-            if isinstance(response, dict):
-                res_json = response.get("output", "")
-            else:
-                res_json = response
-            try:
-                issues_dict = json.loads(res_json)
-            except json.JSONDecodeError:
-                logger.error(f"Response is not valid JSON: {res_json[:80]}...")
-                return []
-            issues = issues_dict.get("issues", [])
-
-            if not issues:
-                logger.info(
-                    f"No problems found in {os.path.basename(file_path)}"
-                )
-                return []
-
-            logger.info(
-                f"Found {len(issues)} problems in {os.path.basename(file_path)}"
+            issues_dict = json.loads(analyzer_response_str)
+        except json.JSONDecodeError as json_err:
+            logger.error(
+                f"Failed to decode JSON response from code_analyzer for {file_name}: {json_err}"
             )
-        except Exception as e:
-            logger.error(f"Error during analysis: {e}")
+            logger.error(
+                f"Response was: {analyzer_response_str[:500]}..."
+            )  # Log problematic response
+            return []
+        except Exception as tool_err:
+            logger.error(
+                f"Error invoking code_analyzer tool for {file_name}: {tool_err}"
+            )
+            traceback.print_exc()
             return []
 
-        created_issues = []
+        if "error" in issues_dict:
+            logger.error(f"Analysis for {file_name} failed: {issues_dict['error']}")
+            return []
+
+        issues = issues_dict.get("issues", [])
+        if not issues:
+            logger.info(f"No significant issues found in {file_name}")
+            return []
+
+        logger.info(f"Found {len(issues)} potential issues in {file_name}")
+        created_issues_summary = []
+
+        # --- Ensure we are on the base branch before processing issues ---
+        try:
+            if self.repo.is_dirty(untracked_files=True):
+                logger.warning(
+                    f"Repo is dirty before processing {file_name}. Stashing changes."
+                )
+                self.repo.git.stash("save", f"ai-analyzer-stash-{file_name}")
+
+            base_branch_name = self.base_branch
+            if self.repo.active_branch.name != base_branch_name:
+                logger.info(f"Switching back to base branch '{base_branch_name}'")
+                self.repo.git.checkout(base_branch_name)
+                # Optional: Pull latest changes from base branch
+                # try:
+                #     origin = self.repo.remote(name='origin')
+                #     origin.pull()
+                #     logger.info(f"Pulled latest changes from origin/{base_branch_name}")
+                # except Exception as pull_err:
+                #     logger.warning(f"Could not pull latest changes from origin/{base_branch_name}: {pull_err}")
+
+        except Exception as e:
+            logger.error(
+                f"Error preparing git state before processing {file_name}: {e}. Skipping auto-fixes for this file."
+            )
+            # We can still create issues, but disable patching for this file run
+            can_patch = False
+        else:
+            can_patch = True  # Git state is clean and on base branch
+
+        # --- Process issues: Create Issue first, then optionally Patch & PR ---
         for issue in issues:
+            issue_info_for_summary = {}
             try:
-                # Build issue body with improved formatting
-                file_name = os.path.basename(file_path)
-                line_url = self._line_url(file_path, issue["line_number"])
+                # --- 1) Create GitHub Issue ---
+                file_rel_path = os.path.relpath(file_path, self.repo_path).replace(
+                    "\\", "/"
+                )
+                line_url = self._line_url(
+                    file_path, issue.get("line_number", 1)
+                )  # Use get with default
 
-                body = f"""
-## Problem detected by AI
+                # Validate required issue fields from LLM response
+                required_fields = [
+                    "type",
+                    "title",
+                    "line_number",
+                    "description",
+                    "original_code",
+                    "solution",
+                    "severity",
+                ]
+                if not all(field in issue for field in required_fields):
+                    logger.warning(
+                        f"Skipping issue due to missing fields in LLM response: {issue}"
+                    )
+                    continue
 
-**File:** [{file_name}]({line_url})  
-**Line:** {issue['line_number']}  
-**Type:** {issue['type']}  
-**Severity:** {issue['severity']}
+                # Ensure line number is valid before using it
+                try:
+                    line_num_int = int(issue["line_number"])
+                    if line_num_int <= 0:
+                        raise ValueError("Line number must be positive")
+                except (ValueError, TypeError) as L_err:
+                    logger.warning(
+                        f"Invalid line number '{issue.get('line_number')}' for issue '{issue.get('title')}'. Skipping. Error: {L_err}"
+                    )
+                    continue
+
+                # Build issue body
+                issue_body = f"""## Problem detected by AI
+
+**File:** [{file_rel_path}]({self._file_url(file_path)})
+**Line:** [{issue['line_number']}]({line_url})
+**Type:** `{issue['type']}`
+**Severity:** `{issue['severity']}`
 
 ### Description
-{issue['description']}
+{issue.get('description', 'N/A')}
 
-### Original code
+### Original Code Snippet
 ```python
-{issue['original_code']}
+{issue.get('original_code', 'N/A')}
 ```
 
 ### Proposed solution
@@ -391,198 +495,359 @@ class GitRepoAnalyzer:
                 gh = Github(GITHUB_TOKEN)
                 repo = gh.get_repo(f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}")
 
-                issue_obj = repo.create_issue(
+                created_gh_issue = repo.create_issue(
                     title=f"[{issue['type']}][{issue['severity']}] {issue['title']}",
-                    body=body,
+                    body=issue_body,
                     labels=[
                         issue["type"].lower(),
                         f"severity:{issue['severity'].lower()}",
                         "ai-detected",
                     ],
                 )
-                issue_number = issue_obj.number
-                issue_url = issue_obj.html_url
+                issue_number = created_gh_issue.number
+                issue_url = created_gh_issue.html_url
                 logger.info(f"Issue created: {issue_url}")
 
                 # ---------- 2) if NOT HIGH, move to the next one ------------
-                if issue["severity"].upper() != "HIGH":
-                    created_issues.append({"url": issue_url, **issue})
-                    continue
+                # Only patch if git state was clean and severity is HIGH/MEDIUM
+                should_attempt_patch = can_patch and issue["severity"].upper() in [
+                    "HIGH",
+                    "MEDIUM",
+                ]
+
+                if not should_attempt_patch:
+                    if not can_patch:
+                        logger.warning(
+                            f"Skipping auto-patch for issue #{issue_number} due to unclean git state or not being on base branch."
+                        )
+                    else:
+                        logger.info(
+                            f"Skipping auto-patch for issue #{issue_number} (Severity: {issue['severity']})"
+                        )
+                    created_issues_summary.append(issue_info_for_summary)
+                    continue  # Move to next issue in the file
 
                 # ---------- 3) create branch, commit and push ----------------------
-                branch = self._create_branch_name(issue["title"])
+                logger.info(f"Attempting auto-patch for issue #{issue_number} (Severity: {issue['severity']})")            
+                branch_name = self._create_branch_name(issue["title"], issue_number)
+                patch_applied = False
+                self.repo.git.checkout(
+                    base_branch_name
+                )  # Ensure starting from clean base
+                self.repo.git.checkout("-b", branch_name)
+                logger.info(f"Created and checked out branch: {branch_name}")
                 try:
                     self._apply_patch(
-                        file_path, issue["line_number"],  issue["original_code"], issue["solution"]
+                        file_path,
+                        issue["line_number"],
+                        issue["original_code"],
+                        issue["solution"],
                     )
-                    self._commit_and_push(
-                        branch,
-                        [os.path.relpath(file_path, self.repo_path)],
-                        f"fix: {issue['title']} (auto-generated by AI)",
+                    patch_applied = True
+                    commit_message = f"fix: Apply AI suggestion for issue #{issue_number}\n\n{issue['title']}"
+                    self.repo.index.add([file_path])  # Add the specific modified file
+                    # Check if there are staged changes before committing
+                    if self.repo.index.diff("HEAD"):
+                        self.repo.index.commit(commit_message)
+                        logger.info(f"Committed changes to branch {branch_name}")
+
+                        # Push the branch
+                        origin = self.repo.remote(name="origin")
+                        # Ensure correct auth method is configured (SSH key or Token in URL)
+                        origin.push(refspec=f"{branch_name}:{branch_name}")
+                        logger.info(f"Pushed branch {branch_name} to origin")
+                    else:
+                        logger.warning(
+                            f"Patch application for issue #{issue_number} resulted in no changes to commit."
+                        )
+                        # No need to create PR if no changes pushed
+                        patch_applied = False  # Reset flag
+                except GitCommandError as git_err:
+                    logger.error(
+                        f"Git command error during patch/commit/push for issue #{issue_number} on branch {branch_name}: {git_err}"
                     )
+                    created_gh_issue.create_comment(
+                        f"⚠️ **AI Auto-Patch Failed:** Git command error occurred.\n```\n{git_err}\n```\nPlease review the suggestion manually."
+                    )
+                    # Switch back to base branch and clean up failed branch locally
+                    self._cleanup_failed_branch(branch_name, base_branch_name)
                 except Exception as e:
                     logger.error(f"Could not push the branch: {e}")
-                    issue_obj.create_comment(
+                    created_gh_issue.create_comment(
                         f"❌ Error creating automatic branch/commit: {e}"
                     )
+                    self._cleanup_failed_branch(branch_name, base_branch_name)
                     continue
 
                 # ---------- 4) create Pull-Request -----------------------------
-                pr_title = f"AI FIX: {issue['title']}"
-                pr_body = (
-                    f"Closes #{issue_number}\n\n"
-                    "Applied the solution suggested by AI."
-                )
-                pr_url = github_pr_creator.invoke(
-                    title=pr_title,
-                    body=pr_body,
-                    head_branch=branch,
-                    base_branch="main",
-                )
-                logger.info(f"PR created: {pr_url}")
+                if patch_applied:
+                    pr_title = f"AI Fix #{issue_number}: {issue['title']}"
+                    pr_body = f"Closes #{issue_number}\n\nAutomatically applied AI code suggestion.\n\nPlease review carefully."
+                    try:
+                        # Use the PR creator tool directly
+                        pr_url = github_pr_creator.invoke(
+                            {
+                                "title": pr_title[:255],
+                                "body": pr_body,
+                                "head_branch": branch_name,
+                                "base_branch": base_branch_name,
+                            }
+                        )
 
-                # ---------- 5) comment on the issue with links --------------
-                issue_obj.create_comment(
-                    f"🚀 A Pull-Request has been opened **[{pr_title}]({pr_url})**\n"
-                    f"Branch: `{branch}`"
+                        if "Error" in pr_url:
+                            raise Exception(
+                                f"PR creation tool returned error: {pr_url}"
+                            )
+
+                        logger.info(
+                            f"Successfully created PR for issue #{issue_number}: {pr_url}"
+                        )
+                        created_gh_issue.create_comment(
+                            f"✅ **AI Auto-Patch Successful:** Pull request created: [{pr_title}]({pr_url})"
+                        )
+                        # Add PR info to the summary for this issue
+                        issue_info_for_summary.update(
+                            {"pr_url": pr_url, "branch": branch_name}
+                        )
+
+                    except Exception as pr_err:
+                        logger.error(
+                            f"Failed to create PR for branch {branch_name} (Issue #{issue_number}): {pr_err}"
+                        )
+                        created_gh_issue.create_comment(
+                            f"⚠️ **AI Auto-Patch Warning:** Patch was applied and pushed to branch `{branch_name}`, but **failed to create Pull Request**.\nError: ```\n{pr_err}\n```\nPlease create the PR manually."
+                        )
+                        # Add branch info even if PR failed
+                        issue_info_for_summary.update(
+                            {"branch": branch_name, "pr_creation_failed": True}
+                        )
+
+                # Append summary info (issue URL, potentially PR URL/branch)
+                created_issues_summary.append(issue_info_for_summary)
+
+                # --- 5) Return to base branch AFTER processing this issue/PR cycle ---
+                logger.debug(
+                    f"Returning to base branch '{base_branch_name}' after processing issue #{issue_number}"
                 )
-
-                created_issues.append(
-                    {"url": issue_url, "pr_url": pr_url, "branch": branch, **issue}
+                self.repo.git.checkout(base_branch_name)
+            except Exception as outer_err:
+                logger.error(
+                    f"Unhandled error processing an issue in {file_name}: {outer_err}"
                 )
+                traceback.print_exc()
+                # Ensure we try to switch back to base branch if something unexpected happened
+                try:
+                    if self.repo.active_branch.name != base_branch_name:
+                        self.repo.git.checkout(base_branch_name)
+                except:  # Catch all exceptions during cleanup checkout
+                    logger.error(
+                        "Failed to switch back to base branch during error handling."
+                    )
+                # Add minimal info if possible
+                if "issue_info_for_summary" in locals() and issue_info_for_summary:
+                    created_issues_summary.append(
+                        issue_info_for_summary
+                    )  # Add at least the issue URL if created
 
-            except Exception as e:
-                logger.error(f"Error creating issue: {e}")
+        try:
+            stashes = self.repo.git.stash("list")
+            if f"ai-analyzer-stash-{file_name}" in stashes:
+                logger.info(f"Popping stashed changes for {file_name}")
+                self.repo.git.stash("pop")
+        except Exception as stash_err:
+            logger.warning(f"Could not pop stash for {file_name}: {stash_err}")
 
-        return created_issues
+        return created_issues_summary
+
+    def _cleanup_failed_branch(self, branch_name: str, base_branch_name: str):
+        """Switches back to base and deletes the failed local branch."""
+        logger.warning(f"Cleaning up failed local branch: {branch_name}")
+        try:
+            self.repo.git.checkout(base_branch_name)
+            self.repo.delete_head(branch_name, force=True)
+            logger.info(f"Deleted local branch {branch_name}")
+        except Exception as e:
+            logger.error(
+                f"Error cleaning up branch {branch_name}: {e}. Manual cleanup might be required."
+            )
 
     def analyze_folder(self):
-        """
-        Analyzes all Python files in the target folder and creates issues for problems.
-        """
+        """Analyzes all Python files in the target folder."""
         folder_abs = os.path.join(self.repo_path, self.target_folder)
-        py_files = glob.glob(f"{folder_abs}/**/*.py", recursive=True)
+        # Use glob with recursive=True and include_hidden=False (or True if needed)
+        # Ensure path separators are correct for the OS
+        glob_pattern = os.path.join(folder_abs, "**", "*.py")
+        py_files = glob.glob(glob_pattern, recursive=True)
 
         if not py_files:
-            logger.warning(f"No Python files found in {self.target_folder}")
+            logger.warning(
+                f"No Python files found in {folder_abs} using pattern {glob_pattern}"
+            )
             print(f"⚠️ No Python files found in {self.target_folder}")
             return
 
-        logger.info(
-            f"Analyzing {len(py_files)} Python files in {self.target_folder}"
+        logger.info(f"Found {len(py_files)} Python files in {self.target_folder}")
+        print(
+            f"🔍 Found {len(py_files)} Python files to analyze in {self.target_folder}"
         )
-        print(f"🔍 Found {len(py_files)} Python files to analyze")
 
-        # Analyze each file and log results
         file_summaries = {}
-        total_issues = 0
+        total_issues_found = 0  # Count issues reported by LLM initially
+        total_issues_created = 0  # Count issues successfully created on GitHub
 
-        for path in py_files:
-            file_name = os.path.basename(path)
-            print(f"🔍 Analyzing {file_name}...")
+        original_branch = self.repo.active_branch.name
+        logger.info(f"Starting analysis from branch: {original_branch}")
 
-            issues = self.analyze_file(path)
-            if issues:
-                rel_path = os.path.relpath(path, self.repo_path)
-                file_summaries[rel_path] = {
-                    "issues": issues,
-                    "issues_count": len(issues),
-                }
-                total_issues += len(issues)
-                print(f"⚠️ Found {len(issues)} problems in {file_name}")
-            else:
-                print(f"✅ No problems found in {file_name}")
-
-        # Create summary issue if problems were found
-        if file_summaries:
-            logger.info(
-                f"Creating summary for {len(file_summaries)} files with problems"
+        for file_path in py_files:
+            # Make path relative for display
+            file_rel_path = os.path.relpath(file_path, self.repo_path).replace(
+                "\\", "/"
             )
-            print(
-                f"\n📊 Creating summary for {len(file_summaries)} files with {total_issues} problems in total"
-            )
-            self.create_summary_issue(file_summaries)
-        else:
-            logger.info("No problems found in any file")
-            print("\n✅ No problems found in any analyzed file!")
+            print(f"\n🔍 Analyzing {file_rel_path}...")
+            try:
+                # Reset git state to base branch before analyzing each file
+                # self.repo.git.checkout("main") # Consider if this is needed before each file or just once before the loop
 
-    def create_summary_issue(self, file_summaries: Dict[str, Dict[str, Any]]):
-        """
-        Creates a summary issue that compiles all found problems
+                issue_details_list = self.analyze_file(file_path)
 
-        Args:
-            file_summaries: Dictionary with issue information by file
-        """
-        print(f"🔍 Creating summary issue...")
-        logger.info(f"Attempting to create summary issue for {self.target_folder}")
-        # Note: 'body' variable is not defined at this point in the original code
-        # logger.debug(f"Size of the summary issue body: {len(body)} characters")
-
-        total_issues = sum(d["issues_count"] for d in file_summaries.values())
-
-        # Build issue body with improved formatting
-        body = f"""# 📑 AI Analysis Report: `{self.target_folder}`
-
-## Executive Summary
-- **Analysis date:** {os.popen('date').read().strip()}
-- **Analyzed commit:** [`{self._commit_sha()[:7]}`](https://github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/commit/{self._commit_sha()})
-- **Files with issues:** **{len(file_summaries)}**
-- **Total detected issues:** **{total_issues}**
-
-## 📋 Details by file
-"""
-        # Counters for statistics
-        issues_by_type = {}
-        issues_by_severity = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
-
-        # Add details by file
-        for file_rel, data in sorted(file_summaries.items()):
-            file_url = self._file_url(os.path.join(self.repo_path, file_rel))
-            body += f"\n### [{file_rel}]({file_url})\n"
-            print(f"🔍 Analyzing {file_rel}...")
-
-            # Group issues by type in this file
-            file_issues_by_type = {}
-            for issue in data["issues"]:
-                issue_type = issue["type"]
-                if issue_type not in file_issues_by_type:
-                    file_issues_by_type[issue_type] = []
-                file_issues_by_type[issue_type].append(issue)
-
-                # Update global counters
-                issues_by_type[issue_type] = issues_by_type.get(issue_type, 0) + 1
-                issues_by_severity[issue["severity"]] += 1
-
-            # Show issues grouped by type
-            for issue_type, issues_list in file_issues_by_type.items():
-                body += f"**{issue_type}:**\n"
-                for issue in issues_list:
-                    body += (
-                        f"- [{issue['title']}]({issue['url']}) ({issue['severity']})\n"
+                if issue_details_list:
+                    num_issues_in_file = len(issue_details_list)
+                    total_issues_created += num_issues_in_file
+                    # Store the detailed list which includes URLs etc.
+                    file_summaries[file_rel_path] = {
+                        "issues": issue_details_list,
+                        "issues_count": num_issues_in_file,
+                    }
+                    print(
+                        f"✅ Finished analyzing {file_rel_path}. Created {num_issues_in_file} GitHub issue(s)."
+                    )
+                    # Note: total_issues_found might differ if some LLM issues failed validation/creation
+                else:
+                    print(
+                        f"✅ Finished analyzing {file_rel_path}. No GitHub issues created."
                     )
 
-            body += "\n"
+            except Exception as file_analysis_err:
+                logger.error(
+                    f"Critical error during analysis of {file_rel_path}: {file_analysis_err}"
+                )
+                print(f"❌ Error analyzing {file_rel_path}. See logs for details.")
+                traceback.print_exc()
+                # Ensure we are back on the original branch if something went wrong
+                try:
+                    if self.repo.active_branch.name != original_branch:
+                        self.repo.git.checkout(original_branch)
+                except Exception as checkout_err:
+                    logger.error(
+                        f"Failed to return to original branch '{original_branch}' during error handling: {checkout_err}"
+                    )
+
+            finally:
+                # Optional: Add delay between files if hitting rate limits
+                # import time
+                # time.sleep(1)
+                pass
+
+        # --- Create Summary Issue ---
+        if file_summaries:
+            logger.info(
+                f"Analysis complete. Creating summary issue for {len(file_summaries)} files with {total_issues_created} issues."
+            )
+            print(
+                f"\n📊 Creating summary issue for {len(file_summaries)} files ({total_issues_created} issues created)..."
+            )
+            # Use the direct PyGithub method
+            self.create_summary_issue_direct(file_summaries)
+        else:
+            logger.info("Analysis complete. No issues were created.")
+            print("\n✅ Analysis finished. No actionable issues were found or created.")
+
+        # --- Final Step: Return to the original branch ---
+        try:
+            if self.repo.active_branch.name != original_branch:
+                logger.info(f"Returning to original branch: {original_branch}")
+                self.repo.git.checkout(original_branch)
+        except Exception as e:
+            logger.error(
+                f"Could not return to original branch '{original_branch}': {e}"
+            )
+
+    def create_summary_issue_direct(self, file_summaries: Dict[str, Dict[str, Any]]):
+        """Creates the summary issue directly using PyGithub."""
+        total_issues = sum(d["issues_count"] for d in file_summaries.values())
+        now_utc = datetime.now(timezone.utc)
+
+        # Build issue body
+        body = f"# 📑 AI Code Analysis Report: `{self.target_folder}`\n\n"
+        body += (
+            f"Analysis completed on **{now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}**\n"
+        )
+        body += f"Analyzed commit: [`{self._commit_sha()[:7]}`]({self._file_url(self.repo_path).replace('/blob/', '/commit/')})\n"  # Link to commit
+        body += f"- **Files with issues:** {len(file_summaries)}\n"
+        body += f"- **Total GitHub issues created:** {total_issues}\n\n"
+        body += "## 📋 Issues Summary by File\n"
+
+        issues_by_type = {}
+        issues_by_severity = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        auto_patched_count = 0
+
+        for file_rel, data in sorted(file_summaries.items()):
+            file_abs_path = os.path.join(self.repo_path, file_rel)
+            file_url = self._file_url(file_abs_path)
+            body += f"\n### [{file_rel}]({file_url}) ({data['issues_count']} issues)\n"
+
+            for issue in data["issues"]:
+                # Use .get() for safety, though validation should ensure keys exist
+                issue_type = issue.get("type", "UNKNOWN")
+                severity = issue.get("severity", "UNKNOWN").upper()
+                title = issue.get("title", "Untitled Issue")
+                issue_url = issue.get("url", "#")  # Link to the created GitHub issue
+
+                body += f"- [{severity}] [{title}]({issue_url})"
+                if issue.get("pr_url"):
+                    body += f" ([PR]({issue['pr_url']}))"
+                    auto_patched_count += 1
+                elif issue.get("branch") and issue.get("pr_creation_failed"):
+                    body += f" (Fix branch: `{issue['branch']}` - PR Failed)"
+                elif issue.get(
+                    "branch"
+                ):  # Patch applied but no PR attempt (e.g., wrong severity)
+                    body += f" (Fix branch: `{issue['branch']}`)"
+                body += "\n"
+
+                # Update stats
+                issues_by_type[issue_type] = issues_by_type.get(issue_type, 0) + 1
+                if severity in issues_by_severity:
+                    issues_by_severity[severity] += 1
 
         # Add statistics
         body += "\n## 📊 Statistics\n"
 
-        # By type
-        body += "\n### By issue type\n"
-        for issue_type, count in sorted(
-            issues_by_type.items(), key=lambda x: x[1], reverse=True
-        ):
-            percentage = (count / total_issues) * 100
-            body += f"- **{issue_type}:** {count} ({percentage:.1f}%)\n"
-
-        # By severity
-        body += "\n### By severity level\n"
-        for severity, count in sorted(
-            issues_by_severity.items(),
-            key=lambda x: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}[x[0]],
-        ):
-            if count > 0:
+        if total_issues > 0:
+            body += "\n### By Issue Type\n"
+            for issue_type, count in sorted(
+                issues_by_type.items(), key=lambda item: item[1], reverse=True
+            ):
                 percentage = (count / total_issues) * 100
-                body += f"- **{severity}:** {count} ({percentage:.1f}%)\n"
+                body += f"- **{issue_type}:** {count} ({percentage:.1f}%)\n"
+
+            body += "\n### By Severity Level\n"
+            severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+            for severity, count in sorted(
+                issues_by_severity.items(),
+                key=lambda item: severity_order.get(item[0], 99),
+            ):
+                if count > 0:
+                    percentage = (count / total_issues) * 100
+                    body += f"- **{severity}:** {count} ({percentage:.1f}%)\n"
+
+            if auto_patched_count > 0:
+                patch_percentage = (auto_patched_count / total_issues) * 100
+                body += f"\n### Auto-Patching\n"
+                body += f"- Issues automatically patched & PR created: {auto_patched_count} ({patch_percentage:.1f}%)\n"
+
+        else:
+            body += "No issues created.\n"
 
         # Final recommendations
         body += """
@@ -599,7 +864,7 @@ class GitRepoAnalyzer:
 
         # Create the summary issue
         payload = {
-            "title": f"📊 AI Global Report: {self.target_folder}",
+            "title": f"📊 AI Analysis Summary: {self.target_folder} ({now_utc.strftime('%Y-%m-%d')})",
             "body": body,
             "labels": ["summary", "ai-analysis", "technical-debt"],
         }
@@ -607,11 +872,12 @@ class GitRepoAnalyzer:
         print(f"🔍 Creating summary issue...")
         print(f"📌 Summary issue payload: {json.dumps(payload, indent=2)}")
         try:
-            url = self.agent.invoke(
-                {
-                    "input": f"Create a summary issue with this payload:\n```json\n{json.dumps(payload)}\n```"
-                }
-            ).get("output", "")
+            gh = Github(GITHUB_TOKEN)
+            repo = gh.get_repo(f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}")
+            issue = repo.create_issue(
+                title=payload["title"], body=payload["body"], labels=payload["labels"]
+            )
+            url = issue.html_url
 
             if url and not url.startswith("Error"):
                 logger.info(f"Summary issue created: {url}")
@@ -623,88 +889,130 @@ class GitRepoAnalyzer:
             logger.error(f"Error creating summary issue: {e}")
             print(f"❌ Error creating summary issue: {e}")
 
-    def _create_branch_name(self, issue_title: str) -> str:
-        date = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
-        slug = slugify(issue_title)[:25]
-        return f"ai/fix/{slug}-{date}"
+    def _create_branch_name(self, issue_title: str, issue_number: int) -> str:
+        """Creates a unique branch name for the fix."""
+        now = datetime.now(timezone.utc)
+        date_str = now.strftime("%Y%m%d")
+        # Sanitize title for branch name
+        slug = slugify(issue_title, max_length=40, word_boundary=True, save_order=True)
+        return f"ai/fix/{date_str}/{issue_number}-{slug}"
 
-    def _apply_patch(self, file_path: str, line_num: int, original_code: str, new_code: str):
-        # 1) read preserving exact line ending
-        eol = self._detect_eol(file_path)
-        
+    def _apply_patch(
+        self,
+        file_path: str,
+        line_num: int,
+        original_code_snippet: str,
+        new_code_snippet: str,
+    ):
+        """
+        Generates a patch using diff-match-patch and applies it using `git apply`.
+        """
+        logger.info(
+            f"Generating patch for {os.path.basename(file_path)} at line {line_num}"
+        )
+        file_basename = os.path.basename(file_path)
+
+        eol, encoding = self._detect_eol_and_encoding(file_path)
+
         try:
-            # Using encoding='utf-8' explicitly is good practice
-            with open(file_path, "r", newline='') as f:
-                lines = f.readlines()
+            # Read the original file content accurately
+            with open(file_path, "r", encoding=encoding, newline="") as f:
+                original_lines = (
+                    f.readlines()
+                )  # Read lines with original EOLs preserved by newline=''
+            original_full_content = "".join(original_lines)
+
         except Exception as e:
-            logger.error(f"Error reading {file_path} to apply patch: {e}")
-            raise  # Re-throw the exception so the process fails cleanly
+            logger.error(f"Error reading file {file_path} for patching: {e}")
+            raise  # Re-raise the exception
 
-        # Make sure line number is valid
-        if line_num <= 0 or line_num > len(lines):
-             logger.error(f"Invalid line number ({line_num}) for file {file_path} with {len(lines)} lines.")
-             # Decide how to handle this error: continue, raise exception?
-             # For now, we raise an exception to stop the process for this issue.
-             raise ValueError(f"Invalid line number: {line_num}")
+        # --- Construct the *intended* modified content ---
+        # This part still requires careful handling of lines and indentation
+        idx = line_num - 1  # 0-based index
 
-        idx = line_num - 1 # 0-based index
-        
-        # Get original indentation
-        original_indent = re.match(r"\s*", lines[idx]).group(0) if idx < len(lines) else "" # Ensure idx is valid
+        if idx < 0 or idx >= len(original_lines):
+            # Log the problematic original_lines list if needed
+            # logger.debug(f"Original lines ({len(original_lines)}): {original_lines}")
+            raise ValueError(
+                f"Invalid line number {line_num} for file {file_path} with {len(original_lines)} lines."
+            )
 
-        # --- START CHANGE ---
-        # Calculate how many lines the detected original code occupies
-        # Use splitlines() to correctly handle different EOLs when counting
-        # Add a fallback to 1 if original_code is empty or None for some reason
-        num_original_lines = len(original_code.splitlines()) if original_code else 1
-        # Make sure not to try to replace beyond the end of file
-        num_original_lines = min(num_original_lines, len(lines) - idx)
-        if num_original_lines <= 0:
-             num_original_lines = 1 # At minimum, replace the line indicated by line_num
+        # Get original indentation from the target line
+        original_indent = re.match(r"^\s*", original_lines[idx]).group(0)
 
-        logger.info(f"Applying patch in {os.path.basename(file_path)}:{line_num}. Replacing {num_original_lines} line(s).")
-        # --- END CHANGE ---
+        # Determine number of lines in the original snippet *provided by AI*
+        # Use splitlines() which handles various EOLs for counting
+        num_original_snippet_lines = (
+            len(original_code_snippet.splitlines()) if original_code_snippet else 1
+        )
+        # Ensure we don't go past the end of the file
+        num_original_snippet_lines = min(
+            num_original_snippet_lines, len(original_lines) - idx
+        )
+        if num_original_snippet_lines <= 0:
+            num_original_snippet_lines = 1  # Should replace at least one line
 
-
-        # 2) maintain original indentation (of the FIRST line to replace)
-        original_indent = re.match(r"\s*", lines[idx]).group(0)
-        if not _is_valid_python(new_code):
-            logger.warning("The replacement provided by AI does not appear to be valid Python code.")
-            # Consider what to do here. Mark the issue? Don't apply?
-            # For now, you could add a TODO as you had, or raise an error.
-            #new_code = f"# TODO: Review invalid AI code:\n# {new_code.replace('\n', '\n# ')}"
-            #new_code = + "\n"+original_code
-            # Or better, don't apply the patch if it's not valid:
-            #raise ValueError("The solution proposed by AI is not valid Python code.")
-            return False
-
-
-        # Prepare new lines with correct indentation and original EOL
-        # Dedent cleans up the base indentation of the AI solution.
-        new_lines_content = textwrap.dedent(new_code).splitlines() # splitlines() removes EOLs
-
+        # Prepare the new code lines, applying original indent and EOL
+        # Dedent the AI's solution first to remove its base indentation
+        new_code_dedented = textwrap.dedent(
+            new_code_snippet
+        ).splitlines()  # Removes EOLs
         prepared_new_lines = []
-        if new_lines_content: # If there's new content
-            for line in new_lines_content:
-                # Apply original indentation. Don't use rstrip() here to preserve intentional trailing spaces.
-                prepared_line = original_indent + line
-                prepared_new_lines.append(prepared_line + eol) # Add the detected EOL
-        # If new_lines_content is empty, prepared_new_lines will be [], removing the original lines.
+        if new_code_dedented:
+            for line in new_code_dedented:
+                # Add original indent, the line content, and detected EOL
+                prepared_new_lines.append(original_indent + line + eol)
+        # If new_code_dedented is empty, prepared_new_lines remains empty, effectively deleting the original lines.
 
-        # 3) replace the correct REGION
-        # Make sure the slice doesn't exceed the bounds
-        end_idx = min(idx + num_original_lines, len(lines))
-        lines[idx : end_idx] = prepared_new_lines
+        # --- Create the modified lines list ---
+        modified_lines = (
+            original_lines[0:idx] +
+            prepared_new_lines +
+            original_lines[idx + num_original_snippet_lines:]
+        )
+        modified_full_content = "".join(modified_lines)
+        original_full_content = "".join(original_lines) # For comparison
 
-        # 4) write with EOL preserved by newline='' and UTF-8
+        # Check if content actually changed
+        if original_full_content == modified_full_content:
+            logger.warning(f"Proposed solution for {file_basename}:{line_num} resulted in no change to file content. Skipping modification.")
+            return # No change needed
+
+        # --- Write the modified content back to the file ---
         try:
-            # Use explicit encoding='utf-8' when writing too
-            with open(file_path, "w", encoding='utf-8', newline='') as f:
-                f.writelines(lines)
-            logger.info(f"Patch successfully applied to {os.path.basename(file_path)}:{line_num}.")
+             with open(file_path, "w", encoding=encoding, newline='') as f:
+                  f.writelines(modified_lines)
+             logger.info(f"Successfully wrote modifications to {file_basename}")
         except Exception as e:
-            logger.error(f"Error writing patch to {file_path}: {e}")
-            raise # Re-throw to stop the process
+            logger.error(f"Error writing modifications back to {file_path}: {e}")
+            # Consider restoring original content if write fails? Complex. Better to fail.
+            raise # Re-raise the exception
+
+        # --- Stage the changes using git add ---
+        try:
+            self.repo.index.add([file_path])
+            logger.info(f"Successfully staged changes in {file_basename} using git add.")
+        except GitCommandError as e:
+            logger.error(f"git add failed for {file_basename}!")
+            logger.error(f"Command: {e.command}")
+            logger.error(f"Status: {e.status}")
+            logger.error(f"Stderr: {e.stderr.strip()}")
+            # Attempt to reset the file in the working directory if add fails?
+            try:
+                self.repo.git.checkout('--', file_path)
+                logger.warning(f"Attempted to reset {file_basename} in working directory after git add failure.")
+            except Exception as reset_err:
+                logger.error(f"Could not reset {file_basename} after git add failure: {reset_err}")
+            raise # Re-raise the GitCommandError
+        except Exception as e:
+             logger.error(f"An unexpected error occurred during git add: {e}")
+             # Also try reset here
+             try:
+                 self.repo.git.checkout('--', file_path)
+                 logger.warning(f"Attempted to reset {file_basename} in working directory after unexpected git add error.")
+             except Exception as reset_err:
+                 logger.error(f"Could not reset {file_basename} after unexpected git add error: {reset_err}")
+             raise
 
     def _commit_and_push(self, branch: str, files_to_add: List[str], message: str):
         origin = self.repo.remote(name="origin")
@@ -758,6 +1066,7 @@ def main():
         print("\n❌ Operation interrupted by user")
     except Exception as e:
         print(f"\n❌ Error: {e}")
+        traceback.print_exc()
         logger.exception("Error in main execution")
 
 
